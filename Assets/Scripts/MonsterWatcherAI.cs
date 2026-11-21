@@ -1,0 +1,466 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+/// <summary>
+/// 病人零号。夜班护士正对着它、它留在画面里、而且中间没有墙时会停住。
+/// </summary>
+[RequireComponent(typeof(CharacterController))]
+public class MonsterWatcherAI : MonoBehaviour
+{
+    public Transform player;
+    public Camera playerCamera;
+    public Light eyeLight;
+    public HospitalNavGraph graph;
+    public Transform armL;
+    public Transform armR;
+    public Transform head;
+    public Material eyeMaterial;
+    public int[] patrolNodes;
+    public float patrolSpeed = 1.8f;
+    public float huntSpeed = 5.4f;
+    public float enragedSpeed = 6.4f;
+
+    CharacterController controller;
+    AudioSource voice;
+    bool hunting;
+    bool enraged;
+    bool frozen;
+    bool wasFrozen;
+    float verticalVelocity;
+    float replanTimer;
+    float moanTimer;
+    int patrolIndex;
+    int pathIndex;
+    int pathGoal = -1;
+    List<int> path = new List<int>();
+    static readonly RaycastHit[] Hits = new RaycastHit[32];
+
+    public bool IsFrozen
+    {
+        get { return frozen; }
+    }
+
+    public bool IsInFrame { get; private set; }
+
+    public bool IsHunting
+    {
+        get { return hunting; }
+    }
+
+    public float DistanceToPlayer
+    {
+        get { return player == null ? 999f : HorizontalDistance(player.position); }
+    }
+
+    public void Enrage()
+    {
+        enraged = true;
+        hunting = true;
+        replanTimer = 0f;
+        if (GameAudio.Instance != null && voice != null)
+            voice.PlayOneShot(GameAudio.Instance.moanClip, 0.9f);
+    }
+
+    public void BindVoice(AudioSource source)
+    {
+        voice = source;
+    }
+
+    void Awake()
+    {
+        controller = GetComponent<CharacterController>();
+    }
+
+    void Start()
+    {
+        moanTimer = 4f;
+        if (voice != null && GameAudio.Instance != null)
+        {
+            voice.clip = GameAudio.Instance.scrapeClip;
+            voice.loop = true;
+            voice.spatialBlend = 1f;
+            voice.minDistance = 1.2f;
+            voice.maxDistance = 18f;
+            voice.rolloffMode = AudioRolloffMode.Linear;
+            voice.volume = 0f;
+            voice.Play();
+        }
+    }
+
+    void Update()
+    {
+        if (player == null)
+            return;
+        if (GameManager.Instance != null && !GameManager.Instance.WorldRunning)
+            return;
+
+        float dt = Time.deltaTime;
+        frozen = IsObserved();
+        if (wasFrozen && !frozen && DistanceToPlayer < 16f && GameHUD.Instance != null)
+            GameHUD.Instance.Toast("它动了");
+        wasFrozen = frozen;
+
+        if (!hunting && (player.position.z > 39.2f || DistanceToPlayer < 8f))
+        {
+            hunting = true;
+            replanTimer = 0f;
+            if (voice != null && GameAudio.Instance != null)
+                voice.PlayOneShot(GameAudio.Instance.moanClip, 0.8f);
+        }
+
+        Vector3 target = ChooseTarget();
+        Vector3 to = target - transform.position;
+        to.y = 0f;
+        bool moving = false;
+        if (!frozen && to.magnitude > 0.3f)
+        {
+            Vector3 direction = Steer(to.normalized);
+            float speed = hunting ? (enraged ? enragedSpeed : huntSpeed) : patrolSpeed;
+            if (hunting && !enraged && DistanceToPlayer < 4.2f)
+                speed *= 1.12f;
+            Move(direction, speed, dt);
+            Face(direction);
+            moving = true;
+        }
+        else
+        {
+            Settle(dt);
+            Vector3 face = player.position - transform.position;
+            face.y = 0f;
+            if (face.sqrMagnitude > 0.01f)
+                Face(face.normalized);
+        }
+
+        Animate(moving);
+        UpdateVoice(moving);
+        UpdateEyes();
+
+        if (GameManager.Instance != null && CanCatchPlayer())
+            GameManager.Instance.Kill();
+
+        moanTimer -= dt;
+        if (moanTimer <= 0f)
+        {
+            moanTimer = Random.Range(7f, 13f);
+            if (voice != null && GameAudio.Instance != null && DistanceToPlayer < 22f)
+                voice.PlayOneShot(GameAudio.Instance.moanClip, hunting ? 0.55f : 0.28f);
+        }
+    }
+
+    bool PulledBackToWard()
+    {
+        return GameManager.Instance != null
+            && GameManager.Instance.gateOpen
+            && !GameManager.Instance.MonsterReleased
+            && player.position.z > 73.2f;
+    }
+
+    bool PlayerBeyondFence()
+    {
+        return GameManager.Instance != null
+            && GameManager.Instance.outerOpen
+            && player.position.z > 84.4f;
+    }
+
+    bool InsideYard()
+    {
+        return transform.position.z > 83.8f
+            && transform.position.x > -6.4f
+            && transform.position.x < 6.4f;
+    }
+
+    Vector3 ChooseTarget()
+    {
+        if (player == null)
+            return transform.position;
+
+        if (PulledBackToWard())
+            return PathTowardWorld(new Vector3(0f, 0f, 70.2f));
+
+        if (PlayerBeyondFence() && InsideYard())
+        {
+            if (transform.position.z > 84.6f && Mathf.Abs(transform.position.x) > 0.8f)
+                return new Vector3(0f, 0f, transform.position.z);
+            return new Vector3(0f, 0f, 80.5f);
+        }
+
+        if (!hunting)
+            return PatrolPoint();
+
+        if (!PlayerBeyondFence() && HasLineOfSightToPlayer() && DistanceToPlayer < 20f)
+            return player.position;
+
+        return NextPathPoint();
+    }
+
+    Vector3 PatrolPoint()
+    {
+        if (graph == null || patrolNodes == null || patrolNodes.Length == 0)
+            return transform.position;
+        if (patrolIndex >= patrolNodes.Length)
+            patrolIndex = 0;
+        Vector3 point = graph.NodePosition(patrolNodes[patrolIndex]);
+        Vector3 flat = point - transform.position;
+        flat.y = 0f;
+        if (flat.magnitude < 0.55f)
+        {
+            patrolIndex = (patrolIndex + 1) % patrolNodes.Length;
+            point = graph.NodePosition(patrolNodes[patrolIndex]);
+        }
+        // Patrol points can be in different rooms; follow the corridor graph
+        // instead of steering straight through the intervening walls.
+        return PathTowardWorld(point);
+    }
+
+    bool CanCatchPlayer()
+    {
+        return player != null && hunting && !frozen && DistanceToPlayer < 1.12f
+            && HasLineOfSightToPlayer();
+    }
+
+    Vector3 NextPathPoint()
+    {
+        if (player == null)
+            return transform.position;
+        return PathTowardWorld(player.position);
+    }
+
+    Vector3 PathTowardWorld(Vector3 world)
+    {
+        if (graph == null)
+            return world;
+
+        int goal = graph.Nearest(world);
+        replanTimer -= Time.deltaTime;
+        if (path.Count == 0 || replanTimer <= 0f || pathGoal != goal)
+        {
+            int from = graph.Nearest(transform.position);
+            List<int> nextPath = graph.PathToward(from, goal);
+            // While travelling an edge, the nearest node may still be behind
+            // us. Preserve that edge's progress when replanning; otherwise the
+            // 0.4-second refresh sends us back to its start over and over.
+            // Keep the first node for a different edge so corners aren't cut.
+            bool continuingSegment = pathIndex > 0 && pathIndex < path.Count
+                && nextPath.Count > 1
+                && nextPath[0] == path[pathIndex - 1]
+                && nextPath[1] == path[pathIndex];
+            path = nextPath;
+            pathIndex = continuingSegment ? 1 : 0;
+            replanTimer = 0.4f;
+            pathGoal = goal;
+        }
+
+        while (pathIndex < path.Count)
+        {
+            Vector3 point = graph.NodePosition(path[pathIndex]);
+            Vector3 flat = point - transform.position;
+            flat.y = 0f;
+            if (flat.magnitude < 0.5f)
+                pathIndex++;
+            else
+                return point;
+        }
+
+        if (path.Count > 0 && path[path.Count - 1] != goal)
+            return graph.NodePosition(path[path.Count - 1]);
+        return world;
+    }
+
+    bool IsObserved()
+    {
+        IsInFrame = false;
+        if (playerCamera == null || player == null)
+            return false;
+
+        ThirdPersonController motor = player.GetComponent<ThirdPersonController>();
+        Vector3 eye = motor != null ? motor.EyePosition : player.position + Vector3.up * 1.52f;
+        Vector3 look = motor != null ? motor.LookDirection : playerCamera.transform.forward;
+        if (look.sqrMagnitude < 0.001f)
+            return false;
+
+        Vector3[] points =
+        {
+            transform.position + Vector3.up * 1.82f,
+            transform.position + Vector3.up * 1.28f,
+            transform.position + Vector3.up * 0.72f
+        };
+
+        // 35° 接近原来第一人称 68° 视野的一半。肩后看得到的黑暗不算看住。
+        const float gazeHalfAngle = 35f;
+        bool gazed = false;
+        for (int i = 0; i < points.Length; i++)
+        {
+            Vector3 to = points[i] - eye;
+            float length = to.magnitude;
+            if (length < 0.2f)
+                continue;
+            Vector3 viewport = playerCamera.WorldToViewportPoint(points[i]);
+            bool inGaze = Vector3.Angle(look, to / length) <= gazeHalfAngle
+                && viewport.z > 0.2f
+                && viewport.x > -0.06f && viewport.x < 1.06f
+                && viewport.y > -0.08f && viewport.y < 1.08f;
+            bool onScreen = viewport.z > 0.25f
+                && viewport.x > 0.03f && viewport.x < 0.97f
+                && viewport.y > 0.04f && viewport.y < 0.96f;
+            if (!inGaze && !onScreen)
+                continue;
+            if (!ClearSight(eye, points[i]))
+                continue;
+            if (onScreen)
+                IsInFrame = true;
+            if (inGaze)
+                gazed = true;
+        }
+        return gazed;
+    }
+
+    bool HasLineOfSightToPlayer()
+    {
+        Vector3 origin = transform.position + Vector3.up * 1.35f;
+        Vector3 target = player.position + Vector3.up * 1.2f;
+        return ClearSight(origin, target);
+    }
+
+    bool ClearSight(Vector3 from, Vector3 to)
+    {
+        Vector3 delta = to - from;
+        float distance = delta.magnitude;
+        if (distance < 0.05f)
+            return true;
+
+        int count = Physics.RaycastNonAlloc(
+            from,
+            delta / distance,
+            Hits,
+            distance,
+            Physics.DefaultRaycastLayers,
+            QueryTriggerInteraction.Ignore);
+
+        for (int i = 0; i < count; i++)
+        {
+            int nearest = i;
+            for (int j = i + 1; j < count; j++)
+            {
+                if (Hits[j].distance < Hits[nearest].distance)
+                    nearest = j;
+            }
+            RaycastHit swap = Hits[i];
+            Hits[i] = Hits[nearest];
+            Hits[nearest] = swap;
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            Collider collider = Hits[i].collider;
+            if (collider == null)
+                continue;
+            if (collider.GetComponentInParent<ThirdPersonController>() != null)
+                continue;
+            if (collider.GetComponentInParent<MonsterWatcherAI>() != null)
+                return true;
+            return false;
+        }
+        return true;
+    }
+
+    Vector3 Steer(Vector3 direction)
+    {
+        Vector3 origin = transform.position + Vector3.up * 0.7f;
+        if (!Blocked(origin, direction, 0.95f))
+            return direction;
+
+        Vector3 side = Vector3.Cross(Vector3.up, direction);
+        if (!Blocked(origin, side, 0.8f))
+            return side.normalized;
+        if (!Blocked(origin, -side, 0.8f))
+            return (-side).normalized;
+        return direction;
+    }
+
+    bool Blocked(Vector3 origin, Vector3 direction, float distance)
+    {
+        RaycastHit hit;
+        if (!Physics.Raycast(origin, direction, out hit, distance, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+            return false;
+        if (hit.collider.GetComponentInParent<ThirdPersonController>() != null)
+            return false;
+        if (hit.collider.GetComponentInParent<MonsterWatcherAI>() != null)
+            return false;
+        return true;
+    }
+
+    void Move(Vector3 direction, float speed, float dt)
+    {
+        if (controller.isGrounded && verticalVelocity < 0f)
+            verticalVelocity = -2f;
+        verticalVelocity += Physics.gravity.y * dt;
+        Vector3 motion = direction * speed;
+        motion.y = verticalVelocity;
+        controller.Move(motion * dt);
+    }
+
+    void Settle(float dt)
+    {
+        if (controller.isGrounded && verticalVelocity < 0f)
+            verticalVelocity = -2f;
+        verticalVelocity += Physics.gravity.y * dt;
+        controller.Move(new Vector3(0f, verticalVelocity * dt, 0f));
+    }
+
+    void Face(Vector3 direction)
+    {
+        if (direction.sqrMagnitude < 0.0001f)
+            return;
+        Quaternion look = Quaternion.LookRotation(direction);
+        transform.rotation = Quaternion.Slerp(transform.rotation, look, 6f * Time.deltaTime);
+    }
+
+    void Animate(bool moving)
+    {
+        float swing = moving ? Mathf.Sin(Time.time * (hunting ? 8f : 3.2f)) * (hunting ? 32f : 16f) : 0f;
+        // 负 X 让手臂朝角色前方伸。停在画面里时它朝护士伸手，手臂没有碰撞，不会改变追上的距离。
+        float reach = frozen ? 34f : 0f;
+        if (armL != null)
+            armL.localRotation = Quaternion.Euler(-reach + swing, 0f, 6f);
+        if (armR != null)
+            armR.localRotation = Quaternion.Euler(-reach - swing, 0f, -6f);
+        if (head != null)
+        {
+            float tilt = frozen ? Mathf.Sin(Time.time * 1.4f) * 4f : Mathf.Sin(Time.time * 6f) * 3f;
+            float crane = frozen ? 16f : 8f;
+            head.localRotation = Quaternion.Euler(crane + tilt, 0f, 0f);
+        }
+    }
+
+    void UpdateVoice(bool moving)
+    {
+        if (voice == null)
+            return;
+        float target = (!frozen && moving) ? (hunting ? 0.45f : 0.18f) : 0f;
+        voice.volume = Mathf.MoveTowards(voice.volume, target, Time.deltaTime * 2f);
+    }
+
+    void UpdateEyes()
+    {
+        float pulse = 1.4f + Mathf.Sin(Time.time * (frozen ? 2f : 7f)) * (frozen ? 0.2f : 0.7f);
+        if (!frozen && hunting)
+            pulse += 1.2f;
+        if (eyeMaterial != null)
+            eyeMaterial.SetColor("_EmissionColor", new Color(0.85f, 0.04f, 0.02f) * pulse);
+        if (eyeLight != null)
+        {
+            // 在追的时候眼睛更亮，方便从她肩后看见亮点；被看住时压暗。
+            float glow = frozen ? 0.25f : (hunting ? 1.35f : 0.45f);
+            eyeLight.intensity = glow * (0.85f + Mathf.Sin(Time.time * (frozen ? 2f : 7f)) * 0.15f);
+            eyeLight.range = frozen ? 1.8f : 3.6f;
+        }
+    }
+
+    float HorizontalDistance(Vector3 world)
+    {
+        Vector3 delta = world - transform.position;
+        delta.y = 0f;
+        return delta.magnitude;
+    }
+}
+
